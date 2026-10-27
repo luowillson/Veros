@@ -6,6 +6,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlmodel import Session, select
 
 from app.db.models import Paper, Review, VerosScore
+from app.services.dimensions import refresh_paper_browse_cache
 from app.services.veros_score import ReviewSignal, ScoreResult, compute_score
 from app.utils.ratings import parse_numeric
 
@@ -237,6 +238,7 @@ def compute_and_store_score(db: Session, paper_id: str) -> ScoreResult:
             },
         )
         db.exec(stmt)
+        refresh_paper_browse_cache(db, paper_id)
         db.commit()
 
     return result

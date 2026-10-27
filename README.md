@@ -372,7 +372,6 @@ Base: `http://localhost:8000/api/v1`
 | GET | `/landing/graph` | Cached semantic graph used on the landing page |
 | GET | `/search?q=&limit=&offset=&sort=&mode=` | Text + semantic search |
 | GET | `/search/page` | Same as `/search`, plus a `total` count for pagination |
-| GET | `/search/count?q=` | Result count only |
 | POST | `/search/lookup` | Submit-time intent classifier; pulls a missing paper from OpenReview when needed |
 | GET | `/papers/{id}` | Full paper detail; 202 + enqueue if not ingested |
 | GET | `/papers/{id}/status` | `{ingest, analysis}` status |

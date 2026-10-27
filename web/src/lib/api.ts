@@ -323,9 +323,16 @@ export async function fetchSearchPage(
     mode,
     sort,
   });
+  // Empty-query browse pages are identical for every viewer — let the
+  // browser/CDN cache them per the API's Cache-Control header. Real searches
+  // stay no-store so users don't see stale or cross-contaminated results.
+  const isBrowse = query.trim() === "";
+  const cacheInit: RequestInit = isBrowse
+    ? { cache: "force-cache", next: { revalidate: 30 } } as RequestInit
+    : { cache: "no-store" };
   const res = await fetch(
     `${API_BASE_URL}/search/page?${params}`,
-    withTimeout({ cache: "no-store", ...init }, SEARCH_TIMEOUT_MS),
+    withTimeout({ ...cacheInit, ...init }, SEARCH_TIMEOUT_MS),
   );
   if (!res.ok) throw new Error(`Search API error ${res.status}`);
   return SearchPageSchema.parse(await res.json());
@@ -380,17 +387,6 @@ export async function lookupSearch(
   }, SEARCH_TIMEOUT_MS));
   if (!res.ok) throw new Error(`Search lookup API error ${res.status}`);
   return SearchLookupResponseSchema.parse(await res.json());
-}
-
-export async function fetchSearchCount(query: string): Promise<number> {
-  const params = new URLSearchParams({ q: query });
-  const res = await fetch(
-    `${API_BASE_URL}/search/count?${params}`,
-    withTimeout({ cache: "no-store" }, SEARCH_TIMEOUT_MS),
-  );
-  if (!res.ok) return 0;
-  const data = z.object({ total: z.number() }).parse(await res.json());
-  return data.total;
 }
 
 export const AuthorRankingSchema = z.object({

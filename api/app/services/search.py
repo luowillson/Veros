@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+from functools import lru_cache
 from typing import Literal, cast
 
 from sqlalchemy import func, text as sa_text
@@ -21,7 +22,6 @@ from app.config import get_settings
 from app.db.models import AIInsight, Paper, VerosScore
 from app.schemas.paper import ConsensusStrength, PaperOut, Verdict
 from app.services.citations import citation_graph_status
-from app.services.dimensions import standardized_dimensions
 
 logger = logging.getLogger(__name__)
 
@@ -45,40 +45,62 @@ def _escape_ilike(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _set_word_similarity_threshold(db: Session, threshold: float) -> None:
+    """SET LOCAL the threshold used by the `<%` operator for this transaction.
+
+    The GIN trgm index can only short-circuit `:q <% col` candidates that meet
+    pg_trgm.word_similarity_threshold (default 0.6). Without this, our 0.16
+    threshold would be applied as a post-filter — too late to avoid the scan.
+    """
+    # SET is a utility statement and does not accept bind parameters; use the
+    # set_config() function form, which does.
+    db.execute(
+        sa_text("SELECT set_config('pg_trgm.word_similarity_threshold', :t, true)"),
+        {"t": str(float(threshold))},
+    )
+
+
 def _fuzzy_text_candidate_ids(db: Session, q: str) -> list[str]:
-    """ILIKE substring + word_similarity; extra per-token rows for multi-word queries."""
+    """ILIKE substring + word_similarity; extra per-token rows for multi-word queries.
+
+    Uses the `<%` operator and lowercased ILIKE against the
+    papers_title_trgm_lower / papers_abstract_trgm_lower GIN indexes so the
+    candidate WHERE collapses to an index scan instead of seq-scanning 400k rows.
+    The ILIKE OR-arms are load-bearing: without them the planner discards the
+    trgm index for `<%` alone (selectivity estimate too loose at 0.16) and
+    falls back to a parallel seq scan, which is ~10x slower.
+    """
     qn = q.strip()
     if not qn:
         return []
 
-    like = f"%{_escape_ilike(qn)}%"
+    qn_lower = qn.lower()
+    like = f"%{_escape_ilike(qn_lower)}%"
     out: list[str] = []
     seen: set[str] = set()
+
+    _set_word_similarity_threshold(db, _FUZZY_WORD_SIM_THRESHOLD)
 
     sql = sa_text(
         """
         SELECT id FROM papers
         WHERE
-          title ILIKE :like ESCAPE '\\'
-          OR COALESCE(abstract, '') ILIKE :like ESCAPE '\\'
-          OR word_similarity(lower(:qn), lower(title)) > :w_th
-          OR word_similarity(
-            lower(:qn), lower(COALESCE(abstract, ''))
-          ) > :w_th
+          lower(title) ILIKE :like ESCAPE '\\'
+          OR lower(COALESCE(abstract, '')) ILIKE :like ESCAPE '\\'
+          OR :qn_lower <% lower(title)
+          OR :qn_lower <% lower(COALESCE(abstract, ''))
         ORDER BY
           (
             CASE
-              WHEN title ILIKE :like ESCAPE '\\'
-                OR COALESCE(abstract, '') ILIKE :like ESCAPE '\\'
+              WHEN lower(title) ILIKE :like ESCAPE '\\'
+                OR lower(COALESCE(abstract, '')) ILIKE :like ESCAPE '\\'
               THEN 1
               ELSE 0
             END
           ) DESC,
           GREATEST(
-            word_similarity(lower(:qn), lower(title)),
-            word_similarity(
-              lower(:qn), lower(COALESCE(abstract, ''))
-            )
+            word_similarity(:qn_lower, lower(title)),
+            word_similarity(:qn_lower, lower(COALESCE(abstract, '')))
           ) DESC
         LIMIT :lim
         """
@@ -87,8 +109,7 @@ def _fuzzy_text_candidate_ids(db: Session, q: str) -> list[str]:
         sql,
         {
             "like": like,
-            "qn": qn,
-            "w_th": _FUZZY_WORD_SIM_THRESHOLD,
+            "qn_lower": qn_lower,
             "lim": _CANDIDATE_POOL,
         },
     ).fetchall()
@@ -98,7 +119,7 @@ def _fuzzy_text_candidate_ids(db: Session, q: str) -> list[str]:
             out.append(r[0])
 
     tokens = [
-        t
+        t.lower()
         for t in re.split(r"\s+", qn)
         if len(t) >= _MIN_TOKEN_LEN
     ][: _MAX_TOKENS]
@@ -107,15 +128,11 @@ def _fuzzy_text_candidate_ids(db: Session, q: str) -> list[str]:
             """
             SELECT id FROM papers
             WHERE
-              word_similarity(lower(:tok), lower(title)) > :w_th
-              OR word_similarity(
-                lower(:tok), lower(COALESCE(abstract, ''))
-              ) > :w_th
+              :tok <% lower(title)
+              OR :tok <% lower(COALESCE(abstract, ''))
             ORDER BY GREATEST(
-              word_similarity(lower(:tok), lower(title)),
-              word_similarity(
-                lower(:tok), lower(COALESCE(abstract, ''))
-              )
+              word_similarity(:tok, lower(title)),
+              word_similarity(:tok, lower(COALESCE(abstract, '')))
             ) DESC
             LIMIT :lim
             """
@@ -127,7 +144,6 @@ def _fuzzy_text_candidate_ids(db: Session, q: str) -> list[str]:
                 tsql,
                 {
                     "tok": tok,
-                    "w_th": _FUZZY_WORD_SIM_THRESHOLD,
                     "lim": min(20, _CANDIDATE_POOL),
                 },
             ).fetchall()
@@ -142,15 +158,25 @@ def _fuzzy_text_candidate_ids(db: Session, q: str) -> list[str]:
 
 
 def top_title_similarity(db: Session, q: str) -> float:
-    """Return the max word_similarity(lower(q), lower(title)) across papers."""
+    """Return the max word_similarity(lower(q), lower(title)) across papers.
+
+    The `<%` filter narrows to GIN-trgm-index candidates before the MAX runs,
+    so the 400k-row seq scan is avoided. If nothing meets the threshold the
+    similarity is effectively below it; report 0.0.
+    """
     qn = q.strip()
     if not qn:
         return 0.0
+    qn_lower = qn.lower()
+    _set_word_similarity_threshold(db, _FUZZY_WORD_SIM_THRESHOLD)
     sql = sa_text(
-        "SELECT COALESCE(MAX(word_similarity(lower(:qn), lower(title))), 0.0) "
-        "FROM papers"
+        """
+        SELECT COALESCE(MAX(word_similarity(:qn_lower, lower(title))), 0.0)
+        FROM papers
+        WHERE :qn_lower <% lower(title)
+        """
     )
-    row = db.execute(sql, {"qn": qn}).first()
+    row = db.execute(sql, {"qn_lower": qn_lower}).first()
     return float(row[0]) if row and row[0] is not None else 0.0
 
 
@@ -193,19 +219,26 @@ def classify_intent(db: Session, q: str) -> dict[str, object]:
 
 
 def best_title_match_id(db: Session, q: str) -> tuple[str | None, float]:
-    """Return (paper_id, score) of the best title-similarity match, if any."""
+    """Return (paper_id, score) of the best title-similarity match, if any.
+
+    Filters to GIN-trgm-index candidates via `<%` before sorting; falls back
+    cleanly to (None, 0.0) when nothing matches above the threshold.
+    """
     qn = q.strip()
     if not qn:
         return None, 0.0
+    qn_lower = qn.lower()
+    _set_word_similarity_threshold(db, _FUZZY_WORD_SIM_THRESHOLD)
     sql = sa_text(
         """
-        SELECT id, word_similarity(lower(:qn), lower(title)) AS sim
+        SELECT id, word_similarity(:qn_lower, lower(title)) AS sim
         FROM papers
+        WHERE :qn_lower <% lower(title)
         ORDER BY sim DESC
         LIMIT 1
         """
     )
-    row = db.execute(sql, {"qn": qn}).first()
+    row = db.execute(sql, {"qn_lower": qn_lower}).first()
     if row is None:
         return None, 0.0
     return str(row[0]), float(row[1] or 0.0)
@@ -216,14 +249,24 @@ def _has_embeddings(db: Session) -> bool:
     return bool(row and row[0])
 
 
-def _semantic_candidate_ids(db: Session, q: str) -> list[str]:
-    if not q.strip() or not _has_embeddings(db):
-        return []
-
+@lru_cache(maxsize=1024)
+def _cached_query_embedding(model_name: str, q_norm: str) -> tuple[float, ...]:
+    """Cache SBERT encodes of normalized query strings; keyed on (model, query)
+    so a model swap invalidates implicitly. The provider singleton stays loaded
+    across calls so cache hits skip the model entirely."""
     from app.services.embeddings.factory import get_embedding_provider
 
     provider = get_embedding_provider()
-    embedding = provider.encode([q])[0]
+    return tuple(provider.encode([q_norm])[0])
+
+
+def _semantic_candidate_ids(db: Session, q: str) -> list[str]:
+    qn = " ".join(q.split()).lower()
+    if not qn or not _has_embeddings(db):
+        return []
+
+    model_name = get_settings().embedding_model
+    embedding = _cached_query_embedding(model_name, qn)
     vec_str = "[" + ",".join(f"{v:.8f}" for v in embedding) + "]"
     sql = sa_text(
         "SELECT paper_id FROM paper_embeddings "
@@ -258,33 +301,24 @@ def _browse_candidate_ids(
     offset: int,
     sort_by: SortKey = "score",
 ) -> list[str]:
-    """Return browse-page IDs ranked globally by score or a standardized dimension."""
+    """Return browse-page IDs ranked globally by score or a standardized dimension.
+
+    Sorts on the cached papers.score / papers.<dimension> columns so the query
+    hits one of the papers_browse_*_idx indexes — no joins, single index scan.
+    """
     if sort_by == "relevance":
         sort_by = "score"
 
     if sort_by == "score":
-        order_expr = "s.score"
+        order = "score DESC NULLS LAST, ingested_at DESC NULLS LAST, created_at DESC"
     else:
-        dimension = _DIMENSION_SORT_SQL[sort_by]
-        order_expr = (
-            "COALESCE("
-            f"(s.breakdown->'standardized_dimensions'->> '{dimension}')::float, "
-            f"i.{dimension}, "
-            "0"
-            ")"
-        )
+        column = _DIMENSION_SORT_SQL[sort_by]
+        order = f"{column} DESC NULLS LAST, score DESC NULLS LAST, created_at DESC"
 
     sql = sa_text(
         f"""
-        SELECT p.id
-        FROM papers p
-        LEFT JOIN veros_scores s ON s.paper_id = p.id
-        LEFT JOIN ai_insights i ON i.paper_id = p.id
-        ORDER BY
-          {order_expr} DESC NULLS LAST,
-          s.score DESC NULLS LAST,
-          p.ingested_at DESC NULLS LAST,
-          p.created_at DESC
+        SELECT id FROM papers
+        ORDER BY {order}
         LIMIT :lim OFFSET :off
         """
     )
@@ -305,7 +339,6 @@ def build_paper_out(
         else "split"
     )
     reviewer_count = int(breakdown.get("n_reviews", 0))
-    dimensions = standardized_dimensions(score_row, insight)
 
     return PaperOut(
         id=paper.id,
@@ -317,13 +350,13 @@ def build_paper_out(
         citation_graph_status=citation_graph_status(paper),
         openreview_url=paper.openreview_url,
         acceptance=paper.acceptance,
-        score=float(score_row.score) if score_row else None,
+        score=float(paper.score) if paper.score is not None else None,
         grade=score_row.grade if score_row else "—",
         verdict=cast(Verdict, score_row.verdict) if score_row else "Insufficient reviews",
-        novelty=dimensions["novelty"],
-        technical=dimensions["technical"],
-        clarity=dimensions["clarity"],
-        impact=dimensions["impact"],
+        novelty=paper.novelty,
+        technical=paper.technical,
+        clarity=paper.clarity,
+        impact=paper.impact,
         tldr=insight.tldr if insight else None,
         consensus=insight.consensus if insight else None,
         consensus_strength=cs,
@@ -393,9 +426,12 @@ def _sort_results(
         results.sort(key=lambda x: rel.get(x.id, 0.0), reverse=True)
         return
 
+    # PaperOut has no `relevance` attribute — for the empty-query browse path,
+    # "relevance" collapses to score (matching _browse_candidate_ids).
+    effective = "score" if sort_by == "relevance" else sort_by
     results.sort(
         key=lambda x: (
-            getattr(x, sort_by) if getattr(x, sort_by) is not None else 0.0,
+            getattr(x, effective) if getattr(x, effective) is not None else 0.0,
             x.score or 0.0,
         ),
         reverse=True,
@@ -403,9 +439,19 @@ def _sort_results(
 
 
 def count_papers(db: Session, query: str) -> int:
-    """Return total result count for the given query (used for pagination)."""
+    """Return total result count for the given query (used for pagination).
+
+    For empty (browse) queries, use Postgres' planner estimate from pg_class
+    instead of a real COUNT(*). At 400k+ rows the exact count is hundreds of
+    ms uncached, and the UI only needs an order-of-magnitude figure.
+    """
     q = query.strip()
     if not q:
+        row = db.execute(
+            sa_text("SELECT reltuples::bigint FROM pg_class WHERE relname = 'papers'")
+        ).first()
+        if row and row[0] is not None and int(row[0]) > 0:
+            return int(row[0])
         return db.exec(select(func.count(Paper.id))).one()  # type: ignore[return-value]
 
     return len(_query_candidate_ids(db, q))
@@ -448,10 +494,10 @@ def search_papers_with_total(
         sort_by = "relevance"
 
     if not q:
-        total = db.exec(select(func.count(Paper.id))).one()
+        total = count_papers(db, q)
         return search_papers(
             db, q, limit=limit, offset=offset, mode=mode, sort_by=sort_by
-        ), int(total)
+        ), total
 
     results = build_results_for_ids(db, _query_candidate_ids(db, q))
     _sort_results(db, q, results, mode, sort_by)
