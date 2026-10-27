@@ -22,6 +22,12 @@ Usage
     python scripts/crawl_citations.py 649def34f8be52c8b66281af98ae884c09aef38b \
         --api-key YOUR_KEY
 
+    # Resume (skip re-fetching references already fully pulled in a prior run)
+    python scripts/crawl_citations.py 649def34f8be52c8b66281af98ae884c09aef38b \
+        --output citations.json --resume
+    python scripts/crawl_citations.py 649def34f8be52c8b66281af98ae884c09aef38b \
+        --resume citations.json --output citations.json
+
 The script performs a breadth-first crawl: starting from the seed paper, it
 fetches all references, then all references of those references, and so on.
 It respects the Semantic Scholar rate limit (1 request per second by default)
@@ -31,6 +37,8 @@ Output is a JSON file containing:
   - papers: dict mapping paper_id → paper metadata
   - edges:  list of {source, target} citation edges
   - stats:  crawl statistics (depth reached, papers found, etc.)
+  - metadata.expanded_paper_ids: S2 ids whose reference lists were fully fetched
+    (used by --resume to avoid duplicate Semantic Scholar calls)
 """
 
 from __future__ import annotations
@@ -45,10 +53,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+EXPANDED_METADATA_KEY = "expanded_paper_ids"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,6 +100,107 @@ class PaperNode:
 class Edge:
     source: str  # paper that cites
     target: str  # paper being cited
+
+
+def _paper_node_from_json(obj: dict[str, Any]) -> PaperNode:
+    """Rebuild a PaperNode from crawl JSON (asdict shape)."""
+    return PaperNode(
+        paper_id=str(obj.get("paper_id") or ""),
+        title=str(obj.get("title") or ""),
+        authors=[str(a) for a in (obj.get("authors") or []) if a],
+        year=obj.get("year"),
+        venue=obj.get("venue"),
+        citation_count=obj.get("citation_count"),
+        reference_count=obj.get("reference_count"),
+        external_ids=dict(obj.get("external_ids") or {}),
+        url=obj.get("url"),
+        depth=int(obj.get("depth") or 0),
+    )
+
+
+def _edge_key(source: str, target: str) -> tuple[str, str]:
+    return (source, target)
+
+
+def load_crawl_json(path: Path) -> tuple[dict[str, PaperNode], list[Edge], set[str], str | None] | None:
+    """Load papers, edges, expanded ids, and stored seed_id from a prior crawl file."""
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read resume file %s: %s", path, exc)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    papers_raw = raw.get("papers")
+    edges_raw = raw.get("edges")
+    if not isinstance(papers_raw, dict) or not isinstance(edges_raw, list):
+        return None
+
+    papers: dict[str, PaperNode] = {}
+    for pid, node in papers_raw.items():
+        if not isinstance(node, dict):
+            continue
+        n = _paper_node_from_json(node)
+        if n.paper_id:
+            papers[n.paper_id] = n
+
+    edges: list[Edge] = []
+    seen_e: set[tuple[str, str]] = set()
+    for row in edges_raw:
+        if not isinstance(row, dict):
+            continue
+        s, t = row.get("source"), row.get("target")
+        if not isinstance(s, str) or not isinstance(t, str) or not s or not t:
+            continue
+        k = _edge_key(s, t)
+        if k in seen_e:
+            continue
+        seen_e.add(k)
+        edges.append(Edge(source=s, target=t))
+
+    meta = raw.get("metadata")
+    expanded: set[str] = set()
+    stored_seed: str | None = None
+    if isinstance(meta, dict):
+        stored_seed = meta.get("seed_id") if isinstance(meta.get("seed_id"), str) else None
+        exp = meta.get(EXPANDED_METADATA_KEY)
+        if isinstance(exp, list):
+            expanded = {str(x) for x in exp if isinstance(x, str) and x}
+        elif exp is None:
+            # Legacy JSON (no expanded_paper_ids): re-fetch /references so we do
+            # not risk skipping partially written graphs.
+            if edges:
+                logger.info(
+                    "Resume file has no %s; reference lists will be re-fetched for "
+                    "non-expanded papers (one-time until you save with this version).",
+                    EXPANDED_METADATA_KEY,
+                )
+            expanded = set()
+
+    return papers, edges, expanded, stored_seed
+
+
+def _build_pending_queue(
+    papers: dict[str, PaperNode],
+    expanded: set[str],
+    *,
+    max_depth: int,
+) -> deque[tuple[str, int]]:
+    """Papers that still need a /references fetch, in ascending BFS depth order."""
+    pending: list[tuple[int, str]] = []
+    for pid, node in papers.items():
+        if pid in expanded:
+            continue
+        if (node.reference_count or 0) <= 0:
+            continue
+        d = node.depth
+        if max_depth >= 0 and d >= max_depth:
+            continue
+        pending.append((d, pid))
+    pending.sort(key=lambda x: (x[0], x[1]))
+    return deque((pid, d) for d, pid in pending)
 
 
 class SemanticScholarCrawler:
@@ -200,35 +311,67 @@ class SemanticScholarCrawler:
         *,
         max_depth: int = -1,
         max_papers: int = -1,
-    ) -> tuple[dict[str, PaperNode], list[Edge]]:
+        resume_papers: dict[str, PaperNode] | None = None,
+        resume_edges: list[Edge] | None = None,
+        resume_expanded: set[str] | None = None,
+    ) -> tuple[dict[str, PaperNode], list[Edge], set[str], str]:
         """BFS crawl starting from seed_id.
 
         Args:
             seed_id: Semantic Scholar paper ID (or DOI:/ARXIV: prefixed).
             max_depth: Maximum BFS depth. -1 means unlimited.
             max_papers: Maximum papers to discover. -1 means unlimited.
+            resume_*: optional state from a prior JSON file (see --resume).
 
         Returns:
-            (papers dict, edges list)
+            (papers dict, edges list, expanded_paper_ids, resolved_seed_paper_id)
         """
-        papers: dict[str, PaperNode] = {}
-        edges: list[Edge] = []
-        queue: deque[tuple[str, int]] = deque()  # (paper_id, depth)
+        papers: dict[str, PaperNode] = dict(resume_papers or {})
+        edges: list[Edge] = list(resume_edges or [])
+        expanded: set[str] = set(resume_expanded or ())
+        edge_seen: set[tuple[str, str]] = {_edge_key(e.source, e.target) for e in edges}
 
-        # Resolve the seed paper
+        # Resolve the seed paper (skip network if raw id already present from resume)
         logger.info("Resolving seed paper: %s", seed_id)
-        if seed_id.startswith("TITLE:"):
+        seed_data: dict[str, Any] | None = None
+        seed_paper_id: str | None = None
+
+        if seed_id in papers and not seed_id.startswith("TITLE:"):
+            seed_paper_id = seed_id
+            seed_data = None
+            logger.info("Using seed paper from resume file (no lookup request).")
+        elif seed_id.startswith("TITLE:"):
             seed_data = self.search_paper(seed_id[6:])
         else:
             seed_data = self.resolve_paper(seed_id)
-        if not seed_data or not seed_data.get("paperId"):
-            logger.error("Could not resolve seed paper: %s", seed_id)
-            return papers, edges
 
-        seed_paper_id = seed_data["paperId"]
-        seed_node = _to_node(seed_data, depth=0)
-        papers[seed_paper_id] = seed_node
-        queue.append((seed_paper_id, 0))
+        if seed_data is not None and seed_data.get("paperId"):
+            seed_paper_id = str(seed_data["paperId"])
+        elif seed_paper_id is None:
+            logger.error("Could not resolve seed paper: %s", seed_id)
+            return papers, edges, expanded, ""
+
+        assert seed_paper_id is not None
+
+        if seed_data is not None:
+            seed_node = _to_node(seed_data, depth=0)
+            papers[seed_paper_id] = seed_node
+        else:
+            if seed_paper_id not in papers:
+                logger.error("Seed %s missing from resume data", seed_paper_id)
+                return papers, edges, expanded, ""
+            papers[seed_paper_id] = replace(papers[seed_paper_id], depth=0)
+
+        seed_node = papers[seed_paper_id]
+        queue = _build_pending_queue(papers, expanded, max_depth=max_depth)
+
+        if resume_papers:
+            logger.info(
+                "Resume: %d papers, %d edges, %d already expanded (skip reference refetch)",
+                len(papers),
+                len(edges),
+                len(expanded),
+            )
 
         logger.info(
             "Seed: %s — \"%s\" (%d references reported)",
@@ -236,6 +379,10 @@ class SemanticScholarCrawler:
             seed_node.title,
             seed_node.reference_count or 0,
         )
+
+        if max_papers >= 0 and len(papers) >= max_papers:
+            logger.info("Already at max papers (%d); nothing to do.", max_papers)
+            return papers, edges, expanded, seed_paper_id
 
         try:
             while queue:
@@ -245,55 +392,68 @@ class SemanticScholarCrawler:
                 if max_depth >= 0 and next_depth > max_depth:
                     continue
 
+                if paper_id in expanded:
+                    continue
+
                 logger.info(
                     "[depth=%d] Fetching references for %s (%d papers found, %d in queue)",
-                    depth, paper_id, len(papers), len(queue),
+                    depth,
+                    paper_id,
+                    len(papers),
+                    len(queue),
                 )
 
                 refs = self.fetch_references(paper_id)
                 new_count = 0
+                stopped_by_paper_cap = False
 
                 for ref_data in refs:
                     ref_id = ref_data.get("paperId")
                     if not ref_id:
                         continue
 
-                    # Record edge
-                    edges.append(Edge(source=paper_id, target=ref_id))
+                    ek = _edge_key(paper_id, ref_id)
+                    if ek not in edge_seen:
+                        edge_seen.add(ek)
+                        edges.append(Edge(source=paper_id, target=ref_id))
 
-                    # Skip if already visited
                     if ref_id in papers:
                         continue
 
-                    # Check paper cap
                     if max_papers >= 0 and len(papers) >= max_papers:
                         logger.info("Reached max papers limit (%d)", max_papers)
-                        # Drain the queue — we still record edges but stop expanding
                         queue.clear()
+                        stopped_by_paper_cap = True
                         break
 
-                    # Add new paper
                     node = _to_node(ref_data, depth=next_depth)
                     papers[ref_id] = node
                     new_count += 1
 
-                    # Only expand papers that have references
                     ref_count = ref_data.get("referenceCount") or 0
-                    if ref_count > 0:
-                        queue.append((ref_id, next_depth))
+                    if ref_count > 0 and (max_depth < 0 or next_depth < max_depth):
+                        if ref_id not in expanded:
+                            queue.append((ref_id, next_depth))
 
                 logger.info(
                     "  → %d references fetched, %d new papers (total: %d)",
-                    len(refs), new_count, len(papers),
+                    len(refs),
+                    new_count,
+                    len(papers),
                 )
+                if not stopped_by_paper_cap:
+                    expanded.add(paper_id)
         except KeyboardInterrupt:
             logger.warning("Crawl interrupted by user. Saving progress so far...")
 
         logger.info(
-            "Crawl complete: %d papers, %d edges, %d API requests",
-            len(papers), len(edges), self._request_count,
+            "Crawl complete: %d papers, %d edges, %d expanded, %d API requests",
+            len(papers),
+            len(edges),
+            len(expanded),
+            self._request_count,
         )
-        return papers, edges
+        return papers, edges, expanded, seed_paper_id
 
 
 def _to_node(data: dict[str, Any], depth: int) -> PaperNode:
@@ -360,6 +520,20 @@ def main() -> None:
         help="Output JSON file. Default: citations_crawl.json",
     )
     parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Continue from an existing crawl JSON: reuse papers/edges and skip "
+            f"Semantic Scholar /references calls for ids in metadata.{EXPANDED_METADATA_KEY}. "
+            "With no FILE, uses the same path as --output. "
+            "Put the seed paper_id before --resume (e.g. ID -o out.json --resume), "
+            "not after --resume, or the id would be treated as the resume file path."
+        ),
+    )
+    parser.add_argument(
         "--api-key",
         default=os.environ.get("SEMANTIC_SCHOLAR_API_KEY", ""),
         help="Semantic Scholar API key. Default: $SEMANTIC_SCHOLAR_API_KEY env var.",
@@ -389,22 +563,51 @@ def main() -> None:
         max_refs_per_paper=args.max_refs_per_paper,
     )
 
+    resume_papers: dict[str, PaperNode] | None = None
+    resume_edges: list[Edge] | None = None
+    resume_expanded: set[str] | None = None
+    stored_seed: str | None = None
+    if args.resume is not None:
+        resume_path = Path(args.resume) if args.resume else Path(args.output)
+        loaded = load_crawl_json(resume_path)
+        if loaded is not None:
+            resume_papers, resume_edges, resume_expanded, stored_seed = loaded
+            logger.info("Loaded resume snapshot from %s", resume_path)
+            if stored_seed and stored_seed != seed_id:
+                logger.warning(
+                    "Resume file seed_id %r differs from current seed %r — "
+                    "continuing anyway; graph may be inconsistent.",
+                    stored_seed,
+                    seed_id,
+                )
+        else:
+            logger.info("No usable resume data at %s; starting a fresh crawl.", resume_path)
+
     start = time.monotonic()
-    papers, edges = crawler.crawl(
+    papers, edges, expanded, resolved_seed = crawler.crawl(
         seed_id,
         max_depth=args.max_depth,
         max_papers=args.max_papers,
+        resume_papers=resume_papers,
+        resume_edges=resume_edges,
+        resume_expanded=resume_expanded,
     )
     elapsed = time.monotonic() - start
+
+    if not resolved_seed:
+        logger.error("Seed paper could not be resolved; no output written.")
+        sys.exit(1)
 
     # Build output
     output = {
         "metadata": {
             "seed_id": seed_id,
+            "resolved_seed_paper_id": resolved_seed,
             "crawled_at": datetime.now(tz=timezone.utc).isoformat(),
             "max_depth": args.max_depth,
             "max_papers": args.max_papers,
             "elapsed_seconds": round(elapsed, 1),
+            EXPANDED_METADATA_KEY: sorted(expanded),
         },
         "stats": {
             "total_papers": len(papers),
@@ -425,9 +628,8 @@ def main() -> None:
     print(f"  Crawl Summary")
     print(f"{'='*60}")
     print(f"  Seed:           {seed_id}")
-    if papers:
-        seed_node = next(iter(papers.values()))
-        print(f"  Title:          {seed_node.title}")
+    if resolved_seed in papers:
+        print(f"  Title:          {papers[resolved_seed].title}")
     print(f"  Papers found:   {len(papers):,}")
     print(f"  Citation edges: {len(edges):,}")
     print(f"  Max depth:      {output['stats']['max_depth_reached']}")

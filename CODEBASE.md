@@ -46,7 +46,7 @@ Veros fetches official peer reviews from OpenReview, computes a deterministic **
 │       ├── routers/
 │       │   ├── health.py       ← GET /health, GET /stats, GET /landing/graph
 │       │   ├── papers.py       ← GET /{id}, GET /{id}/status, POST /batch, POST /{id}/ingest, POST /{id}/analyze
-│       │   ├── search.py       ← GET /search, /search/page, /search/count, POST /search/lookup
+│       │   ├── search.py       ← GET /search, /search/page, POST /search/lookup
 │       │   ├── pathways.py     ← Explore learning pathways
 │       │   ├── rankings.py     ← Author rankings
 │       │   └── saved.py        ← GET/POST/DELETE /saved

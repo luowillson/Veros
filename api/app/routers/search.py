@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Response
 from pydantic import BaseModel
 
 from app.deps import DbSession
@@ -15,7 +15,6 @@ from app.services.search import (
     SortKey,
     best_title_match_id,
     classify_intent,
-    count_papers,
     search_papers,
     search_papers_with_total,
 )
@@ -25,15 +24,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/search", tags=["search"])
 
 
-@router.get("/count")
-def search_count(
-    db: DbSession,
-    q: str = Query(default="", description="Search query"),
-) -> dict[str, int]:
-    """Return total result count for a query — used by the frontend for pagination."""
-    return {"total": count_papers(db, q)}
-
-
 class SearchPageResponse(BaseModel):
     results: list[PaperOut]
     total: int
@@ -41,6 +31,7 @@ class SearchPageResponse(BaseModel):
 
 @router.get("/page", response_model=SearchPageResponse)
 def search_page(
+    response: Response,
     db: DbSession,
     q: str = Query(default="", description="Search query — title keywords or semantic text"),
     limit: int = Query(default=20, ge=1, le=100),
@@ -58,6 +49,11 @@ def search_page(
     results, total = search_papers_with_total(
         db, q, limit=limit, offset=offset, mode=mode, sort_by=sort
     )
+    if not q.strip():
+        # Browse pagination is identical for everyone; let CDN/browser cache it.
+        response.headers["Cache-Control"] = (
+            "public, max-age=30, stale-while-revalidate=300"
+        )
     return SearchPageResponse(results=results, total=total)
 
 

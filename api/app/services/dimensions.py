@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.db.models import AIInsight, VerosScore
+from sqlmodel import Session
+
+from app.db.models import AIInsight, Paper, VerosScore
 
 
 def _dimension_from_breakdown(
@@ -33,3 +35,23 @@ def standardized_dimensions(
         "clarity": clarity if clarity is not None else (insight.clarity if insight else None),
         "impact": impact if impact is not None else (insight.impact if insight else None),
     }
+
+
+def refresh_paper_browse_cache(db: Session, paper_id: str) -> None:
+    """Refresh papers.score + dimension columns from veros_scores and ai_insights.
+
+    Called from scoring.py and analyze.py after they upsert their respective
+    rows so the browse-sort indexes stay in sync. Does not commit.
+    """
+    paper = db.get(Paper, paper_id)
+    if paper is None:
+        return
+    score_row = db.get(VerosScore, paper_id)
+    insight = db.get(AIInsight, paper_id)
+    dims = standardized_dimensions(score_row, insight)
+    paper.score = float(score_row.score) if score_row is not None else None
+    paper.novelty = dims["novelty"]
+    paper.technical = dims["technical"]
+    paper.clarity = dims["clarity"]
+    paper.impact = dims["impact"]
+    db.add(paper)

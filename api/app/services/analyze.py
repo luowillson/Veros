@@ -18,6 +18,7 @@ from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.db.models import AIInsight, Paper, Review
+from app.services.dimensions import refresh_paper_browse_cache
 from app.services.llm.factory import effective_llm_model_name, make_llm_provider
 from app.services.llm.prompts import SYSTEM_PROMPT, build_user_prompt
 from app.services.paper_view import _short_handle
@@ -237,6 +238,7 @@ def analyze_paper(db: Session, paper_id: str, *, force: bool = False) -> AIInsig
 
     paper.analyzed_at = datetime.now(tz=UTC)
     db.add(paper)
+    refresh_paper_browse_cache(db, paper_id)
     db.commit()
 
     settings = get_settings()

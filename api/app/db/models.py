@@ -30,6 +30,14 @@ class Paper(SQLModel, table=True):
         default_factory=lambda: datetime.now(),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
+    # Cached browse-sort columns. Mirrored from veros_scores.score and
+    # standardized_dimensions(score_row, insight) so /search/page can sort
+    # without joining veros_scores + ai_insights.
+    score: float | None = Field(default=None, sa_column=Column(Numeric(3, 1)))
+    novelty: int | None = None
+    technical: int | None = None
+    clarity: int | None = None
+    impact: int | None = None
 
 
 class PaperIdentifier(SQLModel, table=True):
